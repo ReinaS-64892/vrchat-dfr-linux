@@ -1,4 +1,4 @@
-name: Build DXVK gaze-VRS + WiVRn
+name: Build DXVK gaze-VRS + OpenXR bridge
 
 on:
   workflow_dispatch:
@@ -12,16 +12,6 @@ on:
         description: 'DXVK repository URL'
         required: false
         default: 'https://github.com/doitsujin/dxvk.git'
-        type: string
-      wivrn_ref:
-        description: 'WiVRn tag/commit (README pins this to v26.9)'
-        required: true
-        default: 'v26.9'
-        type: string
-      wivrn_repo:
-        description: 'WiVRn repository URL'
-        required: false
-        default: 'https://github.com/WiVRn/WiVRn.git'
         type: string
       release_tag:
         description: 'Optional: create a GitHub Release with this tag (e.g. v1.0-gaze-vrs)'
@@ -79,89 +69,31 @@ jobs:
           name: dxvk-gaze-vrs
           path: dist-dxvk/
 
-  wivrn:
-    name: Build WiVRn (server)
+  gaze:
+    name: Build and test native OpenXR gaze bridge
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install WiVRn build dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential cmake ninja-build pkg-config git zip python3 \
-            libglib2.0-dev libglib2.0-dev-bin \
-            libudev-dev \
-            libusb-1.0-0-dev libhidapi-dev libbluetooth-dev \
-            libavahi-client-dev libavahi-glib-dev \
-            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
-            libboost-dev libboost-locale-dev libboost-url-dev libboost-iostreams-dev \
-            libglm-dev glslang-dev glslang-tools \
-            libspdlog-dev \
-            libx264-dev libdrm-dev \
-            libvulkan-dev \
-            libegl1-mesa-dev libgles2-mesa-dev libgl1-mesa-dev \
-            libeigen3-dev nlohmann-json3-dev libcli11-dev \
-            libnotify-dev \
-            libpng-dev libarchive-dev librsvg2-dev \
-            libpipewire-0.3-dev libsystemd-dev
-
-      - name: Provide Vulkan-Headers >= 1.4.304
-        run: |
-          git clone --depth 1 --branch v1.4.304 \
-            https://github.com/KhronosGroup/Vulkan-Headers.git "$RUNNER_TEMP/vkh"
-
-      - name: Clone WiVRn
-        run: |
-          git clone --recursive "${{ inputs.wivrn_repo || 'https://github.com/WiVRn/WiVRn.git' }}" wivrn
-          git -C wivrn checkout --recurse-submodules "${{ inputs.wivrn_ref || 'v26.9' }}"
-
-      - name: Verify pinned WiVRn revision
-        run: |
-          ref="${{ inputs.wivrn_ref || 'v26.9' }}"
-          if [ "$ref" = "v26.9" ]; then
-            actual="$(git -C wivrn rev-parse HEAD)"
-            expected="bbc6e4cc36c355fa6180980abd231673dc15115d"
-            if [ "$actual" != "$expected" ]; then
-              echo "v26.9 resolved to $actual, expected $expected" >&2
-              exit 1
-            fi
-          fi
-
-      - name: Apply WiVRn patch
-        run: |
-          git -C wivrn apply --check "$GITHUB_WORKSPACE/patches/wivrn-gaze-export.patch"
-          git -C wivrn apply        "$GITHUB_WORKSPACE/patches/wivrn-gaze-export.patch"
-
-      - name: Configure
-        run: |
-          cmake -S wivrn -B wivrn/build -GNinja \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_INSTALL_PREFIX=/usr \
-            -DWIVRN_BUILD_CLIENT=OFF \
-            -DWIVRN_BUILD_SERVER=ON \
-            -DWIVRN_BUILD_DASHBOARD=OFF \
-            -DVulkan_INCLUDE_DIR="$RUNNER_TEMP/vkh/include"
-
+          sudo apt-get install -y build-essential libopenxr-dev pkg-config python3
+      - name: Test projection, shared memory and OpenXR lifecycle
+        run: bash scripts/test-gaze-bridge.sh
       - name: Build
-        run: cmake --build wivrn/build
-
-      - name: Install to staging directory
-        run: |
-          DESTDIR="$PWD/dist-wivrn" cmake --install wivrn/build
-          find dist-wivrn -type f | sort
-
+        run: bash scripts/build-openxr-bridge.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: wivrn-server
-          path: dist-wivrn/
+          name: openxr-gaze-bridge-linux-x86_64
+          path: dist/gaze/
 
   release:
     name: Publish release
-    needs: [dxvk, wivrn]
+    needs: [dxvk, gaze]
     if: |
       always()
       && needs.dxvk.result == 'success'
+      && needs.gaze.result == 'success'
       && (github.event_name == 'push' || inputs.release_tag != '')
     runs-on: ubuntu-latest
     permissions:
@@ -176,22 +108,18 @@ jobs:
           name: dxvk-gaze-vrs
           path: release/dxvk-gaze-vrs
 
-      - name: Download WiVRn artifact
+      - name: Download gaze bridge artifact
         uses: actions/download-artifact@v4
         with:
-          name: wivrn-server
-          path: release/wivrn-server
-        continue-on-error: true
+          name: openxr-gaze-bridge-linux-x86_64
+          path: release/openxr-gaze-bridge
 
       - name: Package
         run: |
           cd release
           zip -r dxvk-gaze-vrs.zip dxvk-gaze-vrs
-          if [ -d wivrn-server ]; then
-            zip -r wivrn-server.zip wivrn-server
-          else
-            echo "wivrn-server artifact not present; releasing DXVK only"
-          fi
+          chmod +x openxr-gaze-bridge/openxr-gaze-bridge
+          zip -r openxr-gaze-bridge-linux-x86_64.zip openxr-gaze-bridge
           ls -la
 
       - name: Create GitHub Release
@@ -204,10 +132,10 @@ jobs:
             Experimental gaze-driven VRS build.
 
             - DXVK base: `${{ inputs.dxvk_ref || 'd30be2ba' }}`
-            - WiVRn base: `${{ inputs.wivrn_ref || 'v26.9' }}`
+            - Gaze: native Linux OpenXR headless bridge (no WiVRn export patch required)
 
             See README for install and VRChat launch configuration.
           files: |
             release/dxvk-gaze-vrs.zip
-            release/wivrn-server.zip
+            release/openxr-gaze-bridge-linux-x86_64.zip
           fail_on_unmatched_files: false

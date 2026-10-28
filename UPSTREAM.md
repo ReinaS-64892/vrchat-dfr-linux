@@ -1,5 +1,9 @@
 # Upstream provenance
 
+The current gaze source is a standalone OpenXR headless bridge. No custom
+WiVRn export patch or xrizer modification is required. The WiVRn pin below is
+retained only for the historical server build scripts.
+
 ## WiVRn
 
 Repository: https://github.com/WiVRn/WiVRn
@@ -23,7 +27,10 @@ The local working checkout also contained a `changes.patch` alongside the edited
 
 Repository: https://github.com/doitsujin/dxvk
 
-The supplied patch was generated against the user's working tree. The exact `git rev-parse HEAD` of that tree was not included in the supplied material, so this repository does not invent one.
+The patch targets `d30be2baea02a67b9502bffda0ec8b0d915bb3d2`, recorded in
+`versions.env`. A clean application to that revision and the 64-bit Windows
+build have been verified locally. The original VRS patch has been updated to
+read the versioned OpenXR bridge protocol instead of WiVRn's export format.
 
 The working DXVK build configuration was:
 
