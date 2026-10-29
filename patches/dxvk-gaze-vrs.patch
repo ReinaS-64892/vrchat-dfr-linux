@@ -248,12 +248,94 @@ index 00000000..71ccea17
 +
 +}
 \ No newline at end of file
+diff --git a/src/dxvk/dxvk_gaze_shm.h b/src/dxvk/dxvk_gaze_shm.h
+new file mode 100644
+index 00000000..5154df19
+--- /dev/null
++++ b/src/dxvk/dxvk_gaze_shm.h
+@@ -0,0 +1,76 @@
++// SPDX-License-Identifier: MIT
++#pragma once
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++
++namespace gaze_bridge {
++// ABI v1: 64 bytes, little endian, 32-bit lock-free atomic words.
++// 0 magic, 1 version, 2 size, 3 sequence, 4 valid,
++// 5..6 left/right U, 7..8 left/right V (top = 0), 9..15 reserved.
++struct alignas(4) SharedGaze { uint32_t words[16]; };
++static_assert(sizeof(SharedGaze) == 64);
++static_assert(__atomic_always_lock_free(sizeof(uint32_t), nullptr));
++constexpr uint32_t Magic = 0x325a4147; // "GAZ2"
++constexpr uint32_t Version = 1;
++struct Sample { bool valid = false; float u[2] = {0.5f, 0.5f}; float v[2] = {0.5f, 0.5f}; };
++inline uint32_t bits(float f) { uint32_t n; std::memcpy(&n, &f, 4); return n; }
++inline float value(uint32_t n) { float f; std::memcpy(&f, &n, 4); return f; }
++inline uint32_t load(const uint32_t* p) { return __atomic_load_n(p, __ATOMIC_SEQ_CST); }
++inline void store(uint32_t* p, uint32_t n) { __atomic_store_n(p, n, __ATOMIC_SEQ_CST); }
++// Single writer, enforced by an exclusive flock for the lifetime of its mapping.
++inline void publish(SharedGaze* memory, const Sample& sample) {
++  uint32_t seq = (load(&memory->words[3]) + 1u) | 1u;
++  store(&memory->words[3], seq);
++  store(&memory->words[0], Magic);
++  store(&memory->words[1], Version);
++  store(&memory->words[2], sizeof(SharedGaze));
++  store(&memory->words[4], sample.valid ? 1 : 0);
++  for (unsigned eye = 0; eye < 2; ++eye) {
++    store(&memory->words[5 + eye], bits(sample.u[eye]));
++    store(&memory->words[7 + eye], bits(sample.v[eye]));
++  }
++  for (unsigned i = 9; i < 16; ++i) store(&memory->words[i], 0);
++  store(&memory->words[3], seq + 1u);
++}
++// Returns a coherent packet, including invalid packets (heartbeat).
++inline bool snapshot(const SharedGaze* memory, Sample& sample, uint32_t& sequence) {
++  for (unsigned attempt = 0; attempt < 4; ++attempt) {
++    uint32_t first = load(&memory->words[3]);
++    if (first & 1u) continue;
++    uint32_t words[16];
++    for (unsigned i = 0; i < 16; ++i) words[i] = load(&memory->words[i]);
++    if (first != load(&memory->words[3])) continue;
++    if (words[0] != Magic || words[1] != Version || words[2] != sizeof(SharedGaze)) return false;
++    sequence = first;
++    sample.valid = words[4] == 1;
++    for (unsigned eye = 0; eye < 2; ++eye) {
++      sample.u[eye] = value(words[5 + eye]);
++      sample.v[eye] = value(words[7 + eye]);
++      if (!std::isfinite(sample.u[eye]) || !std::isfinite(sample.v[eye]) ||
++          sample.u[eye] < 0 || sample.u[eye] > 1 || sample.v[eye] < 0 || sample.v[eye] > 1)
++        sample.valid = false;
++    }
++    return true;
++  }
++  return false;
++}
++// Require a sequence change after mapping: an old valid file is never accepted
++// just because the reader has started. No cross-process clock comparison needed.
++class Freshness {
++public:
++  using Clock = std::chrono::steady_clock;
++  explicit Freshness(Clock::time_point now = Clock::now()) : changed(now) {}
++  bool observe(uint32_t seq, Clock::time_point now) {
++    if (!seen) { seen = true; sequence = seq; return false; }
++    if (seq != sequence) { sequence = seq; changed = now; live = true; }
++    return live && !expired(now);
++  }
++  bool expired(Clock::time_point now) const { return now - changed >= std::chrono::milliseconds(100); }
++private:
++  uint32_t sequence = 0;
++  bool seen = false, live = false;
++  Clock::time_point changed;
++};
++} // namespace gaze_bridge
 diff --git a/src/dxvk/dxvk_gaze_vrs.cpp b/src/dxvk/dxvk_gaze_vrs.cpp
 new file mode 100644
-index 00000000..81bf5eaa
+index 00000000..decb73cd
 --- /dev/null
 +++ b/src/dxvk/dxvk_gaze_vrs.cpp
-@@ -0,0 +1,787 @@
+@@ -0,0 +1,768 @@
 +#include <algorithm>
 +#include <atomic>
 +#include <cmath>
@@ -276,8 +358,6 @@ index 00000000..81bf5eaa
 +
 +namespace dxvk
 +{
-+
-+  static constexpr uint32_t GazeMagic = 0x455a4147u; // "GAZE"
 +
 +  static float getEnvFloat(const char *name, float fallback)
 +  {
@@ -340,7 +420,7 @@ index 00000000..81bf5eaa
 +    m_onlySamples = uint32_t(getEnvFloat("DXVK_GAZE_SAMPLES", 0.0f));
 +    m_onlyFormat = uint32_t(getEnvFloat("DXVK_GAZE_FMT", 0.0f));
 +
-+    // DXVK_GAZE_FAKE=x|y|circle: ignore WiVRn and sweep a synthetic gaze (6 s period)
++    // DXVK_GAZE_FAKE=x|y|circle: ignore OpenXR gaze and sweep a synthetic gaze (6 s period)
 +    {
 +      std::string fake = env::getEnvVar("DXVK_GAZE_FAKE");
 +      m_fake = fake == "x" ? 1 : fake == "y"    ? 2
@@ -378,7 +458,7 @@ index 00000000..81bf5eaa
 +      std::sscanf(forced.c_str(), "%ux%u", &m_forceW, &m_forceH);
 +
 +    if (m_path.empty())
-+      m_path = "Z:\\dev\\shm\\wivrn_gaze";
++      m_path = "Z:\\dev\\shm\\vrchat_dfr_gaze";
 +
 +    m_ok = createResources();
 +
@@ -391,14 +471,7 @@ index 00000000..81bf5eaa
 +
 +  DxvkGazeVrs::~DxvkGazeVrs()
 +  {
-+#ifdef _WIN32
-+    if (m_shm)
-+      UnmapViewOfFile(const_cast<GazeShm *>(m_shm));
-+    if (m_map)
-+      CloseHandle(HANDLE(m_map));
-+    if (m_file)
-+      CloseHandle(HANDLE(m_file));
-+#endif
++    closeSource();
 +  }
 +
 +  bool DxvkGazeVrs::createResources()
@@ -512,7 +585,7 @@ index 00000000..81bf5eaa
 +      return;
 +    }
 +
-+    void *view = MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0);
++    void *view = MapViewOfFile(map, FILE_MAP_READ, 0, 0, sizeof(GazeShm));
 +
 +    if (!view)
 +    {
@@ -523,62 +596,52 @@ index 00000000..81bf5eaa
 +
 +    m_file = file;
 +    m_map = map;
-+    m_shm = static_cast<const volatile GazeShm *>(view);
++    m_shm = static_cast<const GazeShm *>(view);
++    m_sourceFreshness = gaze_bridge::Freshness{};
 +
 +    Logger::info("GazeVRS: gaze source opened");
 +#endif
 +  }
 +
++  void DxvkGazeVrs::closeSource()
++  {
++#ifdef _WIN32
++    if (m_shm) UnmapViewOfFile(const_cast<GazeShm *>(m_shm));
++    if (m_map) CloseHandle(HANDLE(m_map));
++    if (m_file) CloseHandle(HANDLE(m_file));
++#endif
++    m_shm = nullptr;
++    m_map = nullptr;
++    m_file = nullptr;
++  }
++
 +  bool DxvkGazeVrs::readGaze(Gaze &g)
 +  {
 +    if (!m_shm)
-+    {
 +      openSource();
++    if (!m_shm)
++      return false;
 +
-+      if (!m_shm)
-+        return false;
-+    }
-+
-+    for (uint32_t i = 0; i < 4u; i++)
++    const auto now = std::chrono::steady_clock::now();
++    gaze_bridge::Sample sample;
++    uint32_t sequence = 0;
++    if (gaze_bridge::snapshot(m_shm, sample, sequence)
++        && m_sourceFreshness.observe(sequence, now) && sample.valid)
 +    {
-+      uint32_t s1 = m_shm->seq;
-+
-+      if (s1 & 1u)
-+        continue;
-+
-+      std::atomic_thread_fence(std::memory_order_acquire);
-+
-+      uint32_t magic = m_shm->magic;
-+      uint32_t valid = m_shm->valid;
-+
-+      for (uint32_t e = 0; e < 2u; e++)
++      for (uint32_t eye = 0; eye < 2; eye++)
 +      {
-+        g.cx[e] = m_shm->cx[e];
-+        g.cy[e] = m_shm->cy[e];
-+        g.flipX[e] = m_shm->flipX[e];
-+        g.flipY[e] = m_shm->flipY[e];
++        g.cx[eye] = sample.u[eye];
++        g.cy[eye] = sample.v[eye];
++        g.flipX[eye] = 0;
++        g.flipY[eye] = 0;
 +      }
-+
-+      std::atomic_thread_fence(std::memory_order_acquire);
-+
-+      if (s1 != m_shm->seq)
-+        continue;
-+
-+      if (magic != GazeMagic || !valid)
-+        return false;
-+
-+      for (uint32_t e = 0; e < 2u; e++)
-+      {
-+        if (!std::isfinite(g.cx[e]) || !std::isfinite(g.cy[e]))
-+          return false;
-+
-+        g.cx[e] = std::clamp(g.cx[e], 0.0f, 1.0f);
-+        g.cy[e] = std::clamp(g.cy[e], 0.0f, 1.0f);
-+      }
-+
 +      return true;
 +    }
 +
++    // Includes a writer killed during an odd sequence, and replaced files.
++    // Never keep using the last valid packet after the heartbeat stops.
++    if (m_sourceFreshness.expired(now))
++      closeSource();
 +    return false;
 +  }
 +
@@ -1044,11 +1107,13 @@ index 00000000..81bf5eaa
 \ No newline at end of file
 diff --git a/src/dxvk/dxvk_gaze_vrs.h b/src/dxvk/dxvk_gaze_vrs.h
 new file mode 100644
-index 00000000..adaaed29
+index 00000000..e794da61
 --- /dev/null
 +++ b/src/dxvk/dxvk_gaze_vrs.h
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,116 @@
 +#pragma once
++
++#include "dxvk_gaze_shm.h"
 +
 +#include <array>
 +#include <chrono>
@@ -1083,17 +1148,7 @@ index 00000000..adaaed29
 +        VkRenderingFragmentShadingRateAttachmentInfoKHR &info);
 +
 +  private:
-+    // Must match gaze_shm_data in WiVRn's foveation.cpp
-+    struct GazeShm
-+    {
-+      uint32_t magic; // 'GAZE'
-+      uint32_t seq;   // even = stable
-+      float cx[2];    // fovea center, fraction of eye width,  display space
-+      float cy[2];    // fovea center, fraction of eye height, display space, from top
-+      uint32_t valid;
-+      int32_t flipX[2]; // source rect has negative width
-+      int32_t flipY[2]; // source rect has negative height
-+    };
++    using GazeShm = gaze_bridge::SharedGaze;
 +
 +    struct Gaze
 +    {
@@ -1120,8 +1175,9 @@ index 00000000..adaaed29
 +
 +    void *m_file = nullptr;
 +    void *m_map = nullptr;
-+    const volatile GazeShm *m_shm = nullptr;
++    const GazeShm *m_shm = nullptr;
 +    std::chrono::steady_clock::time_point m_nextOpen = {};
++    gaze_bridge::Freshness m_sourceFreshness;
 +
 +    uint32_t m_lastTilesX = 0u;
 +    uint32_t m_lastTilesY = 0u;
@@ -1141,7 +1197,7 @@ index 00000000..adaaed29
 +    uint32_t m_minSize = 700u;
 +    bool m_flipY = false; // extra global Y flip
 +    bool m_swapEyes = false;
-+    int m_forceFlipX[2] = {-1, -1}; // -1 = use WiVRn's value
++    int m_forceFlipX[2] = {-1, -1}; // -1 = use source default
 +    int m_forceFlipY[2] = {-1, -1};
 +    bool m_debug = false;
 +    bool m_dot = false;
@@ -1166,6 +1222,7 @@ index 00000000..adaaed29
 +
 +    bool createResources();
 +    void openSource();
++    void closeSource();
 +    bool readGaze(Gaze &g);
 +  };
 +

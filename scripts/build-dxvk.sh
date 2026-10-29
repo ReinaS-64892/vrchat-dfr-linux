@@ -13,14 +13,17 @@ fi
 
 cd "$source_dir"
 
-rm -rf build
-meson setup build \
+setup_args=()
+if [[ -f build/meson-private/coredata.dat ]]; then
+  setup_args+=(--reconfigure)
+fi
+meson setup "${setup_args[@]}" build \
   --cross-file build-win64.txt \
   -Dbuildtype=release \
   -Denable_d3d8=false \
   -Denable_d3d9=false \
   -Denable_d3d10=false
-ninja -C build
+ninja -C build -j "${DXVK_BUILD_JOBS:-4}"
 
 mkdir -p "$out_dir"
 cp build/src/d3d11/d3d11.dll "$out_dir/"
