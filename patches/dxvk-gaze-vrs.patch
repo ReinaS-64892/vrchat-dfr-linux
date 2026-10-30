@@ -17,7 +17,7 @@ index 38891eb0..8365daa1 100644
              float                   depthBiasConstantFactor,
              float                   depthBiasClamp,
 diff --git a/src/dxvk/dxvk_context.cpp b/src/dxvk/dxvk_context.cpp
-index 47f20bda..a297447c 100644
+index 66b2c539..a58b7623 100644
 --- a/src/dxvk/dxvk_context.cpp
 +++ b/src/dxvk/dxvk_context.cpp
 @@ -7,6 +7,7 @@
@@ -28,7 +28,7 @@ index 47f20bda..a297447c 100644
  
  namespace dxvk {
    
-@@ -6562,7 +6563,51 @@ namespace dxvk {
+@@ -6564,7 +6565,51 @@ namespace dxvk {
  
        m_cmd->beginSecondaryCommandBuffer(inheritance);
      } else {
@@ -81,7 +81,7 @@ index 47f20bda..a297447c 100644
        m_cmd->cmdBeginRendering(DxvkCmdBuffer::ExecBuffer, &renderingInfo);
      }
  
-@@ -6612,6 +6657,38 @@ namespace dxvk {
+@@ -6614,6 +6659,38 @@ namespace dxvk {
        m_cmd->cmdExecuteCommands(1, &cmdBuffer);
      }
  
@@ -121,7 +121,7 @@ index 47f20bda..a297447c 100644
      m_cmd->cmdEndRendering(DxvkCmdBuffer::ExecBuffer);
  
 diff --git a/src/dxvk/dxvk_context.h b/src/dxvk/dxvk_context.h
-index 58d16531..a5de183a 100644
+index 1e9780f2..05b8250c 100644
 --- a/src/dxvk/dxvk_context.h
 +++ b/src/dxvk/dxvk_context.h
 @@ -6,6 +6,7 @@
@@ -141,7 +141,7 @@ index 58d16531..a5de183a 100644
  
      uint64_t                m_frameCount = 0u;
 diff --git a/src/dxvk/dxvk_device_info.cpp b/src/dxvk/dxvk_device_info.cpp
-index ab1f5634..5a84b422 100644
+index 7e3d16a7..a33d6b43 100644
 --- a/src/dxvk/dxvk_device_info.cpp
 +++ b/src/dxvk/dxvk_device_info.cpp
 @@ -48,6 +48,7 @@ namespace dxvk {
@@ -152,7 +152,7 @@ index ab1f5634..5a84b422 100644
      HANDLE_EXT(khrExternalSemaphoreWin32);         \
      HANDLE_EXT(khrIncrementalPresent);             \
      HANDLE_EXT(khrLoadStoreOpNone);                \
-@@ -92,6 +93,7 @@ namespace dxvk {
+@@ -93,6 +94,7 @@ namespace dxvk {
      HANDLE_EXT(extTransformFeedback);              \
      HANDLE_EXT(extVertexAttributeDivisor);         \
      HANDLE_EXT(khrDeviceFault);                    \
@@ -160,7 +160,7 @@ index ab1f5634..5a84b422 100644
      HANDLE_EXT(khrMaintenance5);                   \
      HANDLE_EXT(khrMaintenance6);                   \
      HANDLE_EXT(khrMaintenance7);                   \
-@@ -1042,6 +1044,9 @@ namespace dxvk {
+@@ -1044,6 +1046,9 @@ namespace dxvk {
        ENABLE_EXT_FEATURE(khrDeviceFault, deviceFault, false),
        ENABLE_EXT_FEATURE(khrDeviceFault, deviceFaultVendorBinary, false),
  
@@ -171,7 +171,7 @@ index ab1f5634..5a84b422 100644
        ENABLE_EXT_FEATURE(khrDynamicRenderingLocalRead, dynamicRenderingLocalRead, false),
  
 diff --git a/src/dxvk/dxvk_device_info.h b/src/dxvk/dxvk_device_info.h
-index 40dae678..0d7a2c59 100644
+index a6af2a40..164bf851 100644
 --- a/src/dxvk/dxvk_device_info.h
 +++ b/src/dxvk/dxvk_device_info.h
 @@ -38,6 +38,7 @@ namespace dxvk {
@@ -182,7 +182,7 @@ index 40dae678..0d7a2c59 100644
      VkPhysicalDeviceFaultPropertiesKHR                        khrDeviceFault                  = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_PROPERTIES_KHR };
      VkPhysicalDeviceMaintenance5PropertiesKHR                 khrMaintenance5                 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES_KHR };
      VkPhysicalDeviceMaintenance6PropertiesKHR                 khrMaintenance6                 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_PROPERTIES_KHR };
-@@ -89,6 +90,7 @@ namespace dxvk {
+@@ -90,6 +91,7 @@ namespace dxvk {
      VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT         extVertexAttributeDivisor       = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES };
      VkBool32                                                  khrCalibratedTimestamps         = VK_FALSE;
      VkPhysicalDeviceFaultFeaturesKHR                          khrDeviceFault                  = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_KHR };
@@ -190,7 +190,7 @@ index 40dae678..0d7a2c59 100644
      VkPhysicalDeviceDynamicRenderingLocalReadFeatures         khrDynamicRenderingLocalRead    = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR };
      VkBool32                                                  khrExternalMemoryWin32          = VK_FALSE;
      VkBool32                                                  khrExternalSemaphoreWin32       = VK_FALSE;
-@@ -166,6 +168,7 @@ namespace dxvk {
+@@ -168,6 +170,7 @@ namespace dxvk {
      VkExtensionProperties extVertexAttributeDivisor         = vk::makeExtension(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
      VkExtensionProperties khrCalibratedTimestamps           = vk::makeExtension(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
      VkExtensionProperties khrDeviceFault                    = vk::makeExtension(VK_KHR_DEVICE_FAULT_EXTENSION_NAME);
@@ -1324,7 +1324,7 @@ index 00000000..a2590144
 +
 +}
 diff --git a/src/dxvk/dxvk_graphics.cpp b/src/dxvk/dxvk_graphics.cpp
-index 9823bace..abaf2acd 100644
+index f40b6ec2..241fc731 100644
 --- a/src/dxvk/dxvk_graphics.cpp
 +++ b/src/dxvk/dxvk_graphics.cpp
 @@ -3,6 +3,7 @@
@@ -1369,7 +1369,7 @@ index 98eea481..c00cb29a 100644
      bool eq(const DxvkGraphicsPipelineDynamicState& other) const;
  
 diff --git a/src/dxvk/dxvk_shader.cpp b/src/dxvk/dxvk_shader.cpp
-index 8f6261ba..5d1ce0aa 100644
+index a133519d..c40fc088 100644
 --- a/src/dxvk/dxvk_shader.cpp
 +++ b/src/dxvk/dxvk_shader.cpp
 @@ -1,4 +1,5 @@

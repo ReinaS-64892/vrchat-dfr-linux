@@ -27,9 +27,10 @@ The local working checkout also contained a `changes.patch` alongside the edited
 
 Repository: https://github.com/doitsujin/dxvk
 
-The patch targets `d30be2baea02a67b9502bffda0ec8b0d915bb3d2`, recorded in
-`versions.env`. A clean application to that revision and the 64-bit Windows
-build have been verified locally. The original VRS patch has been updated to
+The patch targets `0cfe0898289fb11e3d8d0e1c62cd344b825b7d57`, recorded in
+`versions.env`, matching the upstream base of the canonical `dfr` branch.
+A clean application to that revision and the 64-bit Windows build have been
+verified locally. The original VRS patch has been updated to
 read the versioned OpenXR bridge protocol instead of WiVRn's export format.
 
 The patch also includes the VRS tile-capacity fix from local DXVK commit
@@ -40,8 +41,8 @@ and pass bounds checks use the same capacity, which is logged at startup.
 
 The patch also ports double-buffered uploads and matching DOT latency from
 canonical DXVK commit `985e429f25ca8c4ac70927f119df66f90e567178`
-(`DXVK_GAZE_COMMIT` in `versions.env`). `DXVK_COMMIT` remains the upstream
-patch-application base, so existing setup and patch application remain valid.
+(`DXVK_GAZE_COMMIT` in `versions.env`). `DXVK_COMMIT` is the matching upstream
+patch-application base; the patched source matches the canonical gaze revision.
 
 The VRS attachment and upload buffer now use two slots. Rendering keeps the
 completed front image while an upload is pending in the back slot. GPU command
