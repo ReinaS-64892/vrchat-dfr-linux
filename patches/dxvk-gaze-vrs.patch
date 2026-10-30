@@ -296,6 +296,204 @@ index 00000000..71ccea17
 +
 +}
 \ No newline at end of file
+diff --git a/src/dxvk/dxvk_gaze_map.h b/src/dxvk/dxvk_gaze_map.h
+new file mode 100644
+index 00000000..92d164de
+--- /dev/null
++++ b/src/dxvk/dxvk_gaze_map.h
+@@ -0,0 +1,192 @@
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cmath>
++#include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++namespace dxvk
++{
++  struct GazeMapRequest
++  {
++    // Width, height, layers, format, sample count.
++    std::array<uint32_t, 5> shape = {};
++    std::array<uint32_t, 2> texel = {16u, 16u};
++    std::array<float, 2> fx = {}, fy = {};
++    std::array<int32_t, 4> center = {}, dotCenter = {};
++    uint32_t flags = 0u, coarse = 5u;
++    float r1 = 0.20f, r2 = 0.40f;
++    float fullArea = -1.0f, midArea = -1.0f;
++
++    bool sameMap(const GazeMapRequest &other) const
++    {
++      // Preserve the existing tile-granularity gaze update cache.
++      return shape == other.shape && texel == other.texel
++          && center == other.center && flags == other.flags && coarse == other.coarse
++          && r1 == other.r1 && r2 == other.r2
++          && fullArea == other.fullArea && midArea == other.midArea;
++    }
++  };
++
++  struct GazeMap
++  {
++    GazeMapRequest request;
++    bool valid = true;
++    std::vector<uint8_t> data;
++  };
++
++  inline void generateGazeMap(const GazeMapRequest &request, GazeMap &result)
++  {
++    result.request = request;
++    result.valid = true;
++    const uint32_t width = request.shape[0], height = request.shape[1];
++    const uint32_t layers = request.shape[2];
++    const bool sbs = layers == 1u;
++    const uint32_t tilesX = (width + request.texel[0] - 1u) / request.texel[0];
++    const uint32_t tilesY = (height + request.texel[1] - 1u) / request.texel[1];
++    const uint32_t layerStride = (tilesX * tilesY + 3u) & ~3u;
++    result.data.resize(size_t(layerStride) * layers);
++    const float eyeW = sbs ? float(width) * 0.5f : float(width);
++    const float minDim = std::min(eyeW, float(height));
++    auto radius = [&](float area, float fallback) {
++      if (area < 0.0f)
++        return fallback;
++      const float a = std::clamp(area, 0.0f, 100.0f) * 0.01f;
++      return a >= 1.0f ? 10.0f : std::sqrt(a * eyeW * float(height) / 3.14159265f) / minDim;
++    };
++    const float r1 = radius(request.fullArea, request.r1);
++    const float r2 = radius(request.midArea, request.r2);
++    const uint32_t mid = std::min(5u, request.coarse);
++    for (uint32_t l = 0u; l < layers; l++)
++    {
++      for (uint32_t ty = 0u; ty < tilesY; ty++)
++      {
++        for (uint32_t tx = 0u; tx < tilesX; tx++)
++        {
++          const float px = (float(tx) + 0.5f) * float(request.texel[0]);
++          const float py = (float(ty) + 0.5f) * float(request.texel[1]);
++          const uint32_t eye = sbs ? (px < eyeW ? 0u : 1u) : l;
++          const float lx = sbs ? px - float(eye) * eyeW : px;
++          const float d = std::hypot(lx - request.fx[eye] * eyeW,
++              py - request.fy[eye] * float(height)) / minDim;
++          result.data[size_t(l) * layerStride + size_t(ty) * tilesX + tx]
++              = d >= r1 ? uint8_t(d >= r2 ? request.coarse : mid) : 0u;
++        }
++      }
++      std::fill(result.data.begin() + size_t(l) * layerStride + tilesX * tilesY,
++          result.data.begin() + size_t(l + 1u) * layerStride, 0u);
++    }
++  }
++
++  struct GazeMapGenerator
++  {
++    bool operator()(const GazeMapRequest &request, GazeMap &result) const
++    {
++      generateGazeMap(request, result);
++      return true;
++    }
++  };
++
++  // Thread primitives are supplied by DXVK in production and by the native
++  // test harness in tests. Only this worker allocates/fills CPU tile maps.
++  template<typename Thread = std::thread, typename Mutex = std::mutex,
++           typename Condition = std::condition_variable, typename Generator = GazeMapGenerator>
++  class GazeMapWorker
++  {
++  public:
++    explicit GazeMapWorker(std::function<void()> init = {}, Generator generate = {},
++        std::chrono::milliseconds poll = std::chrono::milliseconds(0))
++    : m_poll(poll), m_generate(std::move(generate)), m_thread([this, init = std::move(init)] {
++        try {
++          if (init) init();
++          run();
++        } catch (...) {
++          m_failed.store(true, std::memory_order_release);
++        }
++      }) { }
++
++    ~GazeMapWorker()
++    {
++      {
++        std::lock_guard<Mutex> lock(m_mutex);
++        m_stopped = true;
++      }
++      m_condition.notify_one();
++      if (m_thread.joinable()) m_thread.join();
++    }
++
++    bool failed() const { return m_failed.load(std::memory_order_acquire); }
++
++    // Never wait on the render thread, even for the mailbox mutex. Requests
++    // replace the queued request; a running job is allowed to finish so that
++    // continuous gaze motion cannot starve publication of completed maps.
++    bool exchange(const GazeMapRequest &request, bool needed, std::unique_ptr<GazeMap> &result)
++    {
++      std::unique_lock<Mutex> lock(m_mutex, std::try_to_lock);
++      if (!lock.owns_lock()) return false;
++      const bool ready = m_ready;
++      if (ready)
++      {
++        result.swap(m_result);
++        m_ready = false;
++      }
++      if (needed && (!m_requested || !request.sameMap(m_request)))
++      {
++        m_request = request;
++        m_requested = true;
++        m_hasJob = true;
++        m_condition.notify_one();
++      }
++      return ready;
++    }
++
++  private:
++    Mutex m_mutex;
++    Condition m_condition;
++    GazeMapRequest m_request;
++    bool m_requested = false, m_hasJob = false, m_stopped = false, m_ready = false;
++    std::unique_ptr<GazeMap> m_result;
++    std::atomic<bool> m_failed = {false};
++    std::chrono::milliseconds m_poll;
++    Generator m_generate;
++    Thread m_thread;
++
++    void run()
++    {
++      std::unique_ptr<GazeMap> building;
++      for (;;)
++      {
++        GazeMapRequest request;
++        {
++          std::unique_lock<Mutex> lock(m_mutex);
++          auto wake = [this] { return m_stopped || m_hasJob; };
++          if (m_requested && m_poll.count())
++            m_condition.wait_for(lock, m_poll, wake);
++          else
++            m_condition.wait(lock, wake);
++          if (m_stopped) return;
++          request = m_request;
++          m_hasJob = false;
++          // Recycle the previous CPU map returned by the render thread.
++          if (!building && !m_ready) building.swap(m_result);
++        }
++        if (!building) building = std::make_unique<GazeMap>();
++        if (!m_generate(request, *building)) continue;
++        {
++          std::lock_guard<Mutex> lock(m_mutex);
++          // Keep the last completed result even when newer gaze is queued.
++          building.swap(m_result);
++          m_ready = true;
++        }
++      }
++    }
++  };
++}
 diff --git a/src/dxvk/dxvk_gaze_shm.h b/src/dxvk/dxvk_gaze_shm.h
 new file mode 100644
 index 00000000..5154df19
@@ -378,27 +576,17 @@ index 00000000..5154df19
 +  Clock::time_point changed;
 +};
 +} // namespace gaze_bridge
-diff --git a/src/dxvk/dxvk_gaze_vrs.cpp b/src/dxvk/dxvk_gaze_vrs.cpp
+diff --git a/src/dxvk/dxvk_gaze_source.cpp b/src/dxvk/dxvk_gaze_source.cpp
 new file mode 100644
-index 00000000..a8494c13
+index 00000000..9a2806ae
 --- /dev/null
-+++ b/src/dxvk/dxvk_gaze_vrs.cpp
-@@ -0,0 +1,806 @@
-+#include <algorithm>
-+#include <atomic>
-+#include <cmath>
-+#include <cstdio>
-+#include <cstdlib>
-+#include <vector>
-+
-+#include "dxvk_cmdlist.h"
-+#include "dxvk_device.h"
-+#include "dxvk_gaze_dot.h"
-+#include "dxvk_gaze_vrs.h"
-+
++++ b/src/dxvk/dxvk_gaze_source.cpp
+@@ -0,0 +1,277 @@
++#include "dxvk_gaze_source.h"
 +#include "../util/log/log.h"
 +#include "../util/util_env.h"
 +#include "../util/util_string.h"
++#include <cstdlib>
 +
 +#ifdef _WIN32
 +#include "../util/util_win32_compat.h"
@@ -406,7 +594,6 @@ index 00000000..a8494c13
 +
 +namespace dxvk
 +{
-+
 +  static float getEnvFloat(const char *name, float fallback)
 +  {
 +    std::string v = env::getEnvVar(name);
@@ -420,6 +607,355 @@ index 00000000..a8494c13
 +    if (v.empty())
 +      return -1;
 +    return v == "1" ? 1 : 0;
++  }
++
++  DxvkGazeSource::DxvkGazeSource()
++  {
++    m_debug = env::getEnvVar("DXVK_GAZE_DEBUG") == "1";
++    m_flipY = env::getEnvVar("DXVK_GAZE_FLIP_Y") == "1";
++    m_swapEyes = env::getEnvVar("DXVK_GAZE_SWAP_EYES") == "1";
++    m_gainY = getEnvFloat("DXVK_GAZE_GAIN_Y", 1.0f);
++    m_path = env::getEnvVar("DXVK_GAZE_FILE");
++    if (m_path.empty()) m_path = "Z:\\dev\\shm\\vrchat_dfr_gaze";
++    std::string fake = env::getEnvVar("DXVK_GAZE_FAKE");
++    m_fake = fake == "x" ? 1 : fake == "y" ? 2 : fake == "circle" ? 3
++        : fake == "fixed" ? 4 : fake == "grid" ? 5 : 0;
++    m_fixedY = getEnvFloat("DXVK_GAZE_FIXED_Y", 0.25f);
++    m_forceFlipX[0] = getEnvTri("DXVK_GAZE_FLIPX_L");
++    m_forceFlipX[1] = getEnvTri("DXVK_GAZE_FLIPX_R");
++    m_forceFlipY[0] = getEnvTri("DXVK_GAZE_FLIPY_L");
++    m_forceFlipY[1] = getEnvTri("DXVK_GAZE_FLIPY_R");
++  }
++
++  DxvkGazeSource::~DxvkGazeSource()
++  {
++    closeSource();
++  }
++
++  void DxvkGazeSource::openSource()
++  {
++#ifdef _WIN32
++    auto now = std::chrono::steady_clock::now();
++
++    if (now < m_nextOpen)
++      return;
++
++    m_nextOpen = now + std::chrono::seconds(2);
++
++    HANDLE file = CreateFileA(m_path.c_str(), GENERIC_READ,
++                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
++
++    if (file == INVALID_HANDLE_VALUE)
++      return;
++
++    if (GetFileSize(file, nullptr) < sizeof(GazeShm))
++    {
++      CloseHandle(file);
++      return;
++    }
++
++    HANDLE map = CreateFileMappingA(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
++
++    if (!map)
++    {
++      CloseHandle(file);
++      return;
++    }
++
++    void *view = MapViewOfFile(map, FILE_MAP_READ, 0, 0, sizeof(GazeShm));
++
++    if (!view)
++    {
++      CloseHandle(map);
++      CloseHandle(file);
++      return;
++    }
++
++    m_file = file;
++    m_map = map;
++    m_shm = static_cast<const GazeShm *>(view);
++    m_sourceFreshness = gaze_bridge::Freshness{};
++
++    Logger::info("GazeVRS: gaze source opened");
++#endif
++  }
++
++  void DxvkGazeSource::closeSource()
++  {
++#ifdef _WIN32
++    if (m_shm) UnmapViewOfFile(const_cast<GazeShm *>(m_shm));
++    if (m_map) CloseHandle(HANDLE(m_map));
++    if (m_file) CloseHandle(HANDLE(m_file));
++#endif
++    m_shm = nullptr;
++    m_map = nullptr;
++    m_file = nullptr;
++  }
++
++  bool DxvkGazeSource::readGaze(Gaze &g)
++  {
++    if (!m_shm)
++      openSource();
++    if (!m_shm)
++      return false;
++
++    const auto now = std::chrono::steady_clock::now();
++    gaze_bridge::Sample sample;
++    uint32_t sequence = 0;
++    if (gaze_bridge::snapshot(m_shm, sample, sequence)
++        && m_sourceFreshness.observe(sequence, now) && sample.valid)
++    {
++      for (uint32_t eye = 0; eye < 2; eye++)
++      {
++        g.cx[eye] = sample.u[eye];
++        g.cy[eye] = sample.v[eye];
++        g.flipX[eye] = 0;
++        g.flipY[eye] = 0;
++      }
++      return true;
++    }
++
++    // Includes a writer killed during an odd sequence, and replaced files.
++    // Never keep using the last valid packet after the heartbeat stops.
++    if (m_sourceFreshness.expired(now))
++      closeSource();
++    return false;
++  }
++
++  bool DxvkGazeSource::generate(const GazeMapRequest &pass, GazeMap &result)
++  {
++    const auto now = std::chrono::steady_clock::now();
++    const uint32_t width = pass.shape[0], height = pass.shape[1];
++    const uint32_t texelWidth = pass.texel[0], texelHeight = pass.texel[1];
++    const bool sbs = pass.shape[2] == 1u;
++    const uint32_t tilesX = (width + texelWidth - 1u) / texelWidth;
++    const uint32_t tilesY = (height + texelHeight - 1u) / texelHeight;
++    Gaze g = {};
++
++    if (m_fake)
++    {
++      float t = std::chrono::duration<float>(now.time_since_epoch()).count();
++      float a = 0.35f * std::sin(t * 6.2831853f / 6.0f);
++      float b = 0.35f * std::cos(t * 6.2831853f / 6.0f);
++      float x = 0.5f, y = 0.5f;
++
++      if (m_fake == 1)
++        x += a;
++      else if (m_fake == 2)
++        y += a;
++      else if (m_fake == 4)
++        y = m_fixedY; // fixed spot, no motion
++      else if (m_fake == 5)
++      {
++      } // grid: fixed center
++      else
++      {
++        x += a;
++        y += b;
++      }
++
++      for (uint32_t e = 0; e < 2u; e++)
++      {
++        g.cx[e] = x;
++        g.cy[e] = y;
++      }
++    }
++    else if (!readGaze(g))
++    {
++      if (m_debug && !m_loggedNoGaze)
++      {
++        m_loggedNoGaze = true;
++        Logger::info("GazeVRS: candidate pass but no valid gaze data");
++      }
++      if (!m_lastValid) return false;
++      m_lastValid = false;
++      result.valid = false;
++      result.request = pass;
++      return true;
++    }
++
++    for (uint32_t e = 0; e < 2u; e++)
++    {
++      m_winMin[e] = std::min(m_winMin[e], g.cy[e]);
++      m_winMax[e] = std::max(m_winMax[e], g.cy[e]);
++      m_winMinX[e] = std::min(m_winMinX[e], g.cx[e]);
++      m_winMaxX[e] = std::max(m_winMaxX[e], g.cx[e]);
++    }
++
++    if (m_gainY != 1.0f)
++    {
++      for (uint32_t e = 0; e < 2u; e++)
++        g.cy[e] = std::clamp(0.5f + (g.cy[e] - 0.5f) * m_gainY, 0.0f, 1.0f);
++    }
++
++    if (m_swapEyes)
++    {
++      std::swap(g.cx[0], g.cx[1]);
++      std::swap(g.cy[0], g.cy[1]);
++      std::swap(g.flipX[0], g.flipX[1]);
++      std::swap(g.flipY[0], g.flipY[1]);
++    }
++
++    // Fovea position per eye in framebuffer space (0..1, origin top-left of the eye image).
++    // WiVRn reports display space and tells us whether the source image is mirrored.
++    float fx[2], fy[2];
++    uint32_t flags = 0u;
++
++    for (uint32_t e = 0; e < 2u; e++)
++    {
++      bool flipX = m_forceFlipX[e] >= 0 ? m_forceFlipX[e] != 0 : g.flipX[e] != 0;
++      bool flipY = m_forceFlipY[e] >= 0 ? m_forceFlipY[e] != 0 : g.flipY[e] != 0;
++
++      if (m_flipY)
++        flipY = !flipY;
++
++      fx[e] = flipX ? 1.0f - g.cx[e] : g.cx[e];
++      fy[e] = flipY ? 1.0f - g.cy[e] : g.cy[e];
++
++      flags |= (flipX ? 1u : 0u) << (e * 2u) | (flipY ? 1u : 0u) << (e * 2u + 1u);
++    }
++
++    const float eyeW = sbs ? float(width) * 0.5f : float(width);
++
++    const std::array<int32_t, 4> center = {
++        int32_t(fx[0] * eyeW), int32_t(fy[0] * float(height)),
++        int32_t(fx[1] * eyeW), int32_t(fy[1] * float(height))};
++
++    // Quantize to tile granularity so we only re-upload when something visible changes
++    const std::array<int32_t, 4> centerTiles = {
++        center[0] / int32_t(texelWidth), center[1] / int32_t(texelHeight),
++        center[2] / int32_t(texelWidth), center[3] / int32_t(texelHeight)};
++
++    if (m_debug && now >= m_nextGazeLog)
++    {
++      m_nextGazeLog = now + std::chrono::seconds(1);
++      Logger::info(str::format("GazeVRS: ", sbs ? "sbs " : "array ", width, "x", height,
++                               " display L(", g.cx[0], ",", g.cy[0], ") R(", g.cx[1], ",", g.cy[1], ")",
++                               " wivrn flipX=", g.flipX[0], g.flipX[1], " flipY=", g.flipY[0], g.flipY[1],
++                               " -> fb L(", fx[0], ",", fy[0], ") R(", fx[1], ",", fy[1], ")",
++                               " tiles ", tilesX, "x", tilesY));
++      Logger::info(str::format("GazeVRS: raw range last 1s: cx L[", m_winMinX[0], ",", m_winMaxX[0],
++                               "] R[", m_winMinX[1], ",", m_winMaxX[1], "]  cy L[", m_winMin[0], ",", m_winMax[0],
++                               "] R[", m_winMin[1], ",", m_winMax[1], "]  gainY=", m_gainY));
++
++      for (uint32_t e = 0; e < 2u; e++)
++      {
++        m_winMin[e] = m_winMinX[e] = 1.0f;
++        m_winMax[e] = m_winMaxX[e] = 0.0f;
++      }
++    }
++
++    GazeMapRequest request = pass;
++    request.fx = {fx[0], fx[1]};
++    request.fy = {fy[0], fy[1]};
++    request.center = centerTiles;
++    request.dotCenter = center;
++    request.flags = flags;
++    if (m_lastValid && request.sameMap(m_lastRequest)) return false;
++    generateGazeMap(request, result);
++    m_lastRequest = request;
++    m_lastValid = true;
++    return true;
++  }
++}
+diff --git a/src/dxvk/dxvk_gaze_source.h b/src/dxvk/dxvk_gaze_source.h
+new file mode 100644
+index 00000000..8d6442da
+--- /dev/null
++++ b/src/dxvk/dxvk_gaze_source.h
+@@ -0,0 +1,46 @@
++#pragma once
++
++#include "dxvk_gaze_map.h"
++#include "dxvk_gaze_shm.h"
++#include <chrono>
++#include <string>
++
++namespace dxvk
++{
++  // Owned by the map worker. Mapping, heartbeat checks, gaze transforms,
++  // fake gaze and map generation never touch the rendering thread.
++  class DxvkGazeSource
++  {
++  public:
++    DxvkGazeSource();
++    ~DxvkGazeSource();
++    DxvkGazeSource(const DxvkGazeSource &) = delete;
++    DxvkGazeSource &operator=(const DxvkGazeSource &) = delete;
++    bool generate(const GazeMapRequest &pass, GazeMap &result);
++
++  private:
++    using GazeShm = gaze_bridge::SharedGaze;
++    struct Gaze
++    {
++      float cx[2] = {}, cy[2] = {};
++      int32_t flipX[2] = {}, flipY[2] = {};
++    };
++    void *m_file = nullptr, *m_map = nullptr;
++    const GazeShm *m_shm = nullptr;
++    std::chrono::steady_clock::time_point m_nextOpen = {};
++    gaze_bridge::Freshness m_sourceFreshness;
++    bool m_debug = false, m_flipY = false, m_swapEyes = false;
++    int m_forceFlipX[2] = {-1, -1}, m_forceFlipY[2] = {-1, -1};
++    float m_gainY = 1.0f, m_fixedY = 0.25f;
++    int m_fake = 0;
++    std::string m_path;
++    bool m_loggedNoGaze = false, m_lastValid = false;
++    GazeMapRequest m_lastRequest;
++    float m_winMin[2] = {1.0f, 1.0f}, m_winMax[2] = {0.0f, 0.0f};
++    float m_winMinX[2] = {1.0f, 1.0f}, m_winMaxX[2] = {0.0f, 0.0f};
++    std::chrono::steady_clock::time_point m_nextGazeLog = {};
++    void openSource();
++    void closeSource();
++    bool readGaze(Gaze &g);
++  };
++}
+diff --git a/src/dxvk/dxvk_gaze_vrs.cpp b/src/dxvk/dxvk_gaze_vrs.cpp
+new file mode 100644
+index 00000000..b06cdd03
+--- /dev/null
++++ b/src/dxvk/dxvk_gaze_vrs.cpp
+@@ -0,0 +1,565 @@
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++
++#include "dxvk_cmdlist.h"
++#include "dxvk_device.h"
++#include "dxvk_gaze_dot.h"
++#include "dxvk_gaze_vrs.h"
++#include "dxvk_gaze_source.h"
++
++#include "../util/log/log.h"
++#include "../util/util_env.h"
++#include "../util/util_string.h"
++
++namespace dxvk
++{
++
++  // Keep worker implementation and source ownership out of the rendering
++  // header. Destruction joins the worker before closing its source mapping.
++  struct DxvkGazeVrs::Worker
++  {
++    DxvkGazeSource source;
++    struct Generator
++    {
++      DxvkGazeSource *source;
++      bool operator()(const GazeMapRequest &pass, GazeMap &result) const
++      { return source->generate(pass, result); }
++    };
++    GazeMapWorker<dxvk::thread, dxvk::mutex, dxvk::condition_variable, Generator> maps;
++    Worker()
++    : maps([] { env::setThreadName("dxvk-gaze-map"); },
++        Generator{&source}, std::chrono::milliseconds(4)) { }
++  };
++
++  static float getEnvFloat(const char *name, float fallback)
++  {
++    std::string v = env::getEnvVar(name);
++    return v.empty() ? fallback : float(std::atof(v.c_str()));
 +  }
 +
 +  static uint32_t getFragmentRateCode(VkExtent2D size)
@@ -457,27 +993,14 @@ index 00000000..a8494c13
 +    m_fullArea = getEnvFloat("DXVK_GAZE_FULL_AREA", m_fullArea);
 +    m_midArea = getEnvFloat("DXVK_GAZE_MID_AREA", m_midArea);
 +    m_minSize = uint32_t(getEnvFloat("DXVK_GAZE_MINSIZE", float(m_minSize)));
-+    m_flipY = env::getEnvVar("DXVK_GAZE_FLIP_Y") == "1";
-+    m_swapEyes = env::getEnvVar("DXVK_GAZE_SWAP_EYES") == "1";
 +    m_debug = env::getEnvVar("DXVK_GAZE_DEBUG") == "1";
 +    m_dot = env::getEnvVar("DXVK_GAZE_DOT") == "1";
 +    m_dotRadius = int32_t(getEnvFloat("DXVK_GAZE_DOT_RADIUS", float(m_dotRadius)));
-+    m_path = env::getEnvVar("DXVK_GAZE_FILE");
 +
-+    m_gainY = getEnvFloat("DXVK_GAZE_GAIN_Y", 1.0f);
 +    m_onlySamples = uint32_t(getEnvFloat("DXVK_GAZE_SAMPLES", 0.0f));
 +    m_onlyFormat = uint32_t(getEnvFloat("DXVK_GAZE_FMT", 0.0f));
 +
-+    // DXVK_GAZE_FAKE=x|y|circle: ignore OpenXR gaze and sweep a synthetic gaze (6 s period)
-+    {
-+      std::string fake = env::getEnvVar("DXVK_GAZE_FAKE");
-+      m_fake = fake == "x" ? 1 : fake == "y"    ? 2
-+                             : fake == "circle" ? 3
-+                             : fake == "fixed"  ? 4
-+                             : fake == "grid"   ? 5
-+                                                : 0;
-+      m_fixedY = getEnvFloat("DXVK_GAZE_FIXED_Y", m_fixedY);
-+    }
++    m_grid = env::getEnvVar("DXVK_GAZE_FAKE") == "grid";
 +
 +    // Raw shading rate code for the outer zone: (log2(w) << 2) | log2(h)
 +    // 5 = 2x2, 6 = 2x4, 9 = 4x2, 10 = 4x4.
@@ -496,31 +1019,25 @@ index 00000000..a8494c13
 +      m_coarse = uint32_t(std::atof(coarse.c_str()));
 +    }
 +
-+    m_forceFlipX[0] = getEnvTri("DXVK_GAZE_FLIPX_L");
-+    m_forceFlipX[1] = getEnvTri("DXVK_GAZE_FLIPX_R");
-+    m_forceFlipY[0] = getEnvTri("DXVK_GAZE_FLIPY_L");
-+    m_forceFlipY[1] = getEnvTri("DXVK_GAZE_FLIPY_R");
-+
 +    std::string forced = env::getEnvVar("DXVK_GAZE_SIZE");
 +    if (!forced.empty())
 +      std::sscanf(forced.c_str(), "%ux%u", &m_forceW, &m_forceH);
 +
-+    if (m_path.empty())
-+      m_path = "Z:\\dev\\shm\\vrchat_dfr_gaze";
-+
 +    m_ok = createResources();
++    if (m_ok)
++      m_mapWorker = std::make_unique<Worker>();
 +
 +    Logger::info(str::format("GazeVRS: init ", m_ok ? "ok" : "FAILED",
 +                             ", double-buffered, texel ", m_texel.width, "x", m_texel.height,
 +                             ", max tiles ", m_maxTiles.width, "x", m_maxTiles.height,
 +                             ", r1=", m_r1, " r2=", m_r2, ", full_area=", m_fullArea,
 +                             ", mid_area=", m_midArea, ", coarse=", coarse,
-+                             ", file=", m_path));
++                             ", async map worker"));
 +  }
 +
 +  DxvkGazeVrs::~DxvkGazeVrs()
 +  {
-+    closeSource();
++    m_mapWorker.reset();
 +  }
 +
 +  DxvkGazeVrs::Slot::~Slot()
@@ -623,97 +1140,6 @@ index 00000000..a8494c13
 +    }
 +
 +    return true;
-+  }
-+
-+  void DxvkGazeVrs::openSource()
-+  {
-+#ifdef _WIN32
-+    auto now = std::chrono::steady_clock::now();
-+
-+    if (now < m_nextOpen)
-+      return;
-+
-+    m_nextOpen = now + std::chrono::seconds(2);
-+
-+    HANDLE file = CreateFileA(m_path.c_str(), GENERIC_READ,
-+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-+
-+    if (file == INVALID_HANDLE_VALUE)
-+      return;
-+
-+    if (GetFileSize(file, nullptr) < sizeof(GazeShm))
-+    {
-+      CloseHandle(file);
-+      return;
-+    }
-+
-+    HANDLE map = CreateFileMappingA(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
-+
-+    if (!map)
-+    {
-+      CloseHandle(file);
-+      return;
-+    }
-+
-+    void *view = MapViewOfFile(map, FILE_MAP_READ, 0, 0, sizeof(GazeShm));
-+
-+    if (!view)
-+    {
-+      CloseHandle(map);
-+      CloseHandle(file);
-+      return;
-+    }
-+
-+    m_file = file;
-+    m_map = map;
-+    m_shm = static_cast<const GazeShm *>(view);
-+    m_sourceFreshness = gaze_bridge::Freshness{};
-+
-+    Logger::info("GazeVRS: gaze source opened");
-+#endif
-+  }
-+
-+  void DxvkGazeVrs::closeSource()
-+  {
-+#ifdef _WIN32
-+    if (m_shm) UnmapViewOfFile(const_cast<GazeShm *>(m_shm));
-+    if (m_map) CloseHandle(HANDLE(m_map));
-+    if (m_file) CloseHandle(HANDLE(m_file));
-+#endif
-+    m_shm = nullptr;
-+    m_map = nullptr;
-+    m_file = nullptr;
-+  }
-+
-+  bool DxvkGazeVrs::readGaze(Gaze &g)
-+  {
-+    if (!m_shm)
-+      openSource();
-+    if (!m_shm)
-+      return false;
-+
-+    const auto now = std::chrono::steady_clock::now();
-+    gaze_bridge::Sample sample;
-+    uint32_t sequence = 0;
-+    if (gaze_bridge::snapshot(m_shm, sample, sequence)
-+        && m_sourceFreshness.observe(sequence, now) && sample.valid)
-+    {
-+      for (uint32_t eye = 0; eye < 2; eye++)
-+      {
-+        g.cx[eye] = sample.u[eye];
-+        g.cy[eye] = sample.v[eye];
-+        g.flipX[eye] = 0;
-+        g.flipY[eye] = 0;
-+      }
-+      return true;
-+    }
-+
-+    // Includes a writer killed during an odd sequence, and replaced files.
-+    // Never keep using the last valid packet after the heartbeat stops.
-+    if (m_sourceFreshness.expired(now))
-+      closeSource();
-+    return false;
 +  }
 +
 +  bool DxvkGazeVrs::prepare(
@@ -858,99 +1284,8 @@ index 00000000..a8494c13
 +    if (tilesX > m_maxTiles.width || tilesY > m_maxTiles.height)
 +      return false;
 +
-+    Gaze g = {};
-+
-+    if (m_fake)
-+    {
-+      float t = std::chrono::duration<float>(now.time_since_epoch()).count();
-+      float a = 0.35f * std::sin(t * 6.2831853f / 6.0f);
-+      float b = 0.35f * std::cos(t * 6.2831853f / 6.0f);
-+      float x = 0.5f, y = 0.5f;
-+
-+      if (m_fake == 1)
-+        x += a;
-+      else if (m_fake == 2)
-+        y += a;
-+      else if (m_fake == 4)
-+        y = m_fixedY; // fixed spot, no motion
-+      else if (m_fake == 5)
-+      {
-+      } // grid: fixed center
-+      else
-+      {
-+        x += a;
-+        y += b;
-+      }
-+
-+      for (uint32_t e = 0; e < 2u; e++)
-+      {
-+        g.cx[e] = x;
-+        g.cy[e] = y;
-+      }
-+    }
-+    else if (!readGaze(g))
-+    {
-+      if (m_debug && !m_loggedNoGaze)
-+      {
-+        m_loggedNoGaze = true;
-+        Logger::info("GazeVRS: candidate pass but no valid gaze data");
-+      }
-+      return false;
-+    }
-+
-+    for (uint32_t e = 0; e < 2u; e++)
-+    {
-+      m_winMin[e] = std::min(m_winMin[e], g.cy[e]);
-+      m_winMax[e] = std::max(m_winMax[e], g.cy[e]);
-+      m_winMinX[e] = std::min(m_winMinX[e], g.cx[e]);
-+      m_winMaxX[e] = std::max(m_winMaxX[e], g.cx[e]);
-+    }
-+
-+    if (m_gainY != 1.0f)
-+    {
-+      for (uint32_t e = 0; e < 2u; e++)
-+        g.cy[e] = std::clamp(0.5f + (g.cy[e] - 0.5f) * m_gainY, 0.0f, 1.0f);
-+    }
-+
-+    if (m_swapEyes)
-+    {
-+      std::swap(g.cx[0], g.cx[1]);
-+      std::swap(g.cy[0], g.cy[1]);
-+      std::swap(g.flipX[0], g.flipX[1]);
-+      std::swap(g.flipY[0], g.flipY[1]);
-+    }
-+
-+    // Fovea position per eye in framebuffer space (0..1, origin top-left of the eye image).
-+    // WiVRn reports display space and tells us whether the source image is mirrored.
-+    float fx[2], fy[2];
-+    uint32_t flags = 0u;
-+
-+    for (uint32_t e = 0; e < 2u; e++)
-+    {
-+      bool flipX = m_forceFlipX[e] >= 0 ? m_forceFlipX[e] != 0 : g.flipX[e] != 0;
-+      bool flipY = m_forceFlipY[e] >= 0 ? m_forceFlipY[e] != 0 : g.flipY[e] != 0;
-+
-+      if (m_flipY)
-+        flipY = !flipY;
-+
-+      fx[e] = flipX ? 1.0f - g.cx[e] : g.cx[e];
-+      fy[e] = flipY ? 1.0f - g.cy[e] : g.cy[e];
-+
-+      flags |= (flipX ? 1u : 0u) << (e * 2u) | (flipY ? 1u : 0u) << (e * 2u + 1u);
-+    }
-+
 +    const uint32_t usedLayers = sbs ? 1u : MaxLayers;
 +    const float eyeW = sbs ? float(extent.width) * 0.5f : float(extent.width);
-+
-+    const std::array<int32_t, 4> center = {
-+        int32_t(fx[0] * eyeW), int32_t(fy[0] * float(extent.height)),
-+        int32_t(fx[1] * eyeW), int32_t(fy[1] * float(extent.height))};
-+
-+    // Quantize to tile granularity so we only re-upload when something visible changes
-+    const std::array<int32_t, 4> centerTiles = {
-+        center[0] / int32_t(m_texel.width), center[1] / int32_t(m_texel.height),
-+        center[2] / int32_t(m_texel.width), center[3] / int32_t(m_texel.height)};
-+
 +    const std::array<uint32_t, 5> shape = {
 +        extent.width, extent.height, usedLayers, uint32_t(colorFormat), uint32_t(samples)};
 +
@@ -975,88 +1310,44 @@ index 00000000..a8494c13
 +      cmd->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &dep);
 +    }
 +
-+    const bool changed = m_buffers.active < 0 || m_slots[m_buffers.active]->shape != shape
-+        || m_slots[m_buffers.active]->flags != flags || m_slots[m_buffers.active]->coarse != coarse
-+        || m_slots[m_buffers.active]->center != centerTiles;
-+    const int32_t back = m_buffers.writable(completed);
-+    const bool upload = changed && back >= 0;
++    GazeMapRequest request;
++    request.shape = shape;
++    request.texel = {m_texel.width, m_texel.height};
++    request.coarse = coarse;
++    request.r1 = m_r1;
++    request.r2 = m_r2;
++    request.fullArea = m_fullArea;
++    request.midArea = m_midArea;
 +
-+    if (m_debug && now >= m_nextGazeLog)
++    if (m_mapWorker->maps.failed())
 +    {
-+      m_nextGazeLog = now + std::chrono::seconds(1);
-+      Logger::info(str::format("GazeVRS: ", sbs ? "sbs " : "array ", extent.width, "x", extent.height,
-+                               " display L(", g.cx[0], ",", g.cy[0], ") R(", g.cx[1], ",", g.cy[1], ")",
-+                               " wivrn flipX=", g.flipX[0], g.flipX[1], " flipY=", g.flipY[0], g.flipY[1],
-+                               " -> fb L(", fx[0], ",", fy[0], ") R(", fx[1], ",", fy[1], ")",
-+                               " tiles ", tilesX, "x", tilesY));
-+      Logger::info(str::format("GazeVRS: raw range last 1s: cx L[", m_winMinX[0], ",", m_winMaxX[0],
-+                               "] R[", m_winMinX[1], ",", m_winMaxX[1], "]  cy L[", m_winMin[0], ",", m_winMax[0],
-+                               "] R[", m_winMin[1], ",", m_winMax[1], "]  gainY=", m_gainY));
-+
-+      for (uint32_t e = 0; e < 2u; e++)
++      if (!m_loggedWorkerFailure)
 +      {
-+        m_winMin[e] = m_winMinX[e] = 1.0f;
-+        m_winMax[e] = m_winMaxX[e] = 0.0f;
++        Logger::err("GazeVRS: map worker failed; disabling VRS");
++        m_loggedWorkerFailure = true;
 +      }
++      return false;
 +    }
++    m_mapWorker->maps.exchange(request, true, m_cpuMap);
++    const int32_t back = m_buffers.writable(completed);
++    // A completed map can lag behind gaze, but must match this render target.
++    // Do not upload a map already displayed or already pending on the GPU.
++    auto matches = [&](const Rc<Slot> &slot) {
++      return slot->shape == m_cpuMap->request.shape && slot->flags == m_cpuMap->request.flags
++          && slot->coarse == m_cpuMap->request.coarse && slot->center == m_cpuMap->request.center;
++    };
++    const bool upload = back >= 0 && m_cpuMap && m_cpuMap->valid
++        && m_cpuMap->request.shape == shape && m_cpuMap->request.coarse == coarse
++        && (m_buffers.active < 0 || !matches(m_slots[m_buffers.active]));
 +
 +    VkImageSubresourceRange allLayers = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, MaxLayers};
 +
 +    if (upload)
 +    {
 +      auto &slot = m_slots[back];
-+      const uint32_t tileCount = tilesX * tilesY;
-+      const uint32_t layerStride = (tileCount + 3u) & ~3u;
-+      std::vector<uint8_t> data(size_t(layerStride) * usedLayers, 0u);
-+
-+      const uint32_t mid = std::min<uint32_t>(5u, coarse);
-+
-+      // Radii are in units of min(eye width, eye height). If an area percentage is set, convert it: area = pi * R^2 * min^2  ->  R = sqrt(area * W * H / pi) / min
-+      const float eyeH = float(extent.height);
-+      const float minDim = std::min(eyeW, eyeH);
-+
-+      auto areaToRadius = [&](float percent)
-+      {
-+        float a = std::clamp(percent, 0.0f, 100.0f) * 0.01f;
-+        if (a >= 1.0f)
-+          return 10.0f; // 100% = whole eye, corners included
-+        return std::sqrt(a * eyeW * eyeH / 3.14159265f) / minDim;
-+      };
-+
-+      const float r1 = m_fullArea >= 0.0f ? areaToRadius(m_fullArea) : m_r1;
-+      const float r2 = m_midArea >= 0.0f ? areaToRadius(m_midArea) : m_r2;
-+
-+      for (uint32_t l = 0; l < usedLayers; l++)
-+      {
-+        for (uint32_t ty = 0; ty < tilesY; ty++)
-+        {
-+          for (uint32_t tx = 0; tx < tilesX; tx++)
-+          {
-+            float px = (float(tx) + 0.5f) * float(m_texel.width);
-+            float py = (float(ty) + 0.5f) * float(m_texel.height);
-+
-+            uint32_t eye = l;
-+            float lx = px;
-+
-+            if (sbs)
-+            {
-+              eye = px < eyeW ? 0u : 1u;
-+              lx = px - float(eye) * eyeW;
-+            }
-+
-+            float cxp = fx[eye] * eyeW;
-+            float cyp = fy[eye] * float(extent.height);
-+            float d = std::hypot(lx - cxp, py - cyp) / std::min(eyeW, float(extent.height));
-+
-+            uint8_t rate = 0u;
-+
-+            if (d >= r1)
-+              rate = uint8_t(d >= r2 ? coarse : mid);
-+
-+            data[size_t(l) * layerStride + size_t(ty) * tilesX + tx] = rate;
-+          }
-+        }
-+      }
++      const uint32_t layerStride = (tilesX * tilesY + 3u) & ~3u;
++      const auto &data = m_cpuMap->data;
++      const auto &mapRequest = m_cpuMap->request;
 +
 +      // Previous uses of this slot have completed on the GPU. No broad
 +      // graphics-to-transfer dependency is needed for a free back slot.
@@ -1119,17 +1410,18 @@ index 00000000..a8494c13
 +
 +      slot->layoutInit = true;
 +      slot->shape = shape;
-+      slot->flags = flags;
-+      slot->coarse = coarse;
-+      slot->center = centerTiles;
-+      slot->dotCenter = center;
++      slot->flags = mapRequest.flags;
++      slot->coarse = mapRequest.coarse;
++      slot->center = mapRequest.center;
++      slot->dotCenter = mapRequest.dotCenter;
 +      cmd->track(slot);
 +      cmd->queueSignal(slot->completion, m_buffers.upload(back));
 +    }
 +
 +    // During startup or a render-target change, use full-rate rendering until
 +    // a compatible attachment is ready rather than waiting for an upload.
-+    if (m_buffers.active < 0 || m_slots[m_buffers.active]->shape != shape || m_slots[m_buffers.active]->coarse != coarse)
++    if (!m_cpuMap || !m_cpuMap->valid || m_buffers.active < 0
++        || m_slots[m_buffers.active]->shape != shape || m_slots[m_buffers.active]->coarse != coarse)
 +      return false;
 +
 +    auto &front = m_slots[m_buffers.active];
@@ -1139,7 +1431,7 @@ index 00000000..a8494c13
 +    //  - normal: magenta dots at the displayed attachment's saved gaze,
 +    //    including its upload latency and tile-granularity update caching.
 +    //  - FAKE=grid: 8 differently colored squares at known framebuffer positions
-+    if ((m_dot || m_fake == 5) && sbs)
++    if ((m_dot || m_grid) && sbs)
 +    {
 +      g_gazeDot.passActive = true;
 +      g_gazeDot.width = int32_t(extent.width);
@@ -1164,7 +1456,7 @@ index 00000000..a8494c13
 +        d.rgb[2] = cb;
 +      };
 +
-+      if (m_fake == 5)
++      if (m_grid)
 +      {
 +        const int32_t sz = 70;
 +        add(0.03f, 0.06f, sz, 1.0f, 0.0f, 0.0f); // top-left corner      red
@@ -1192,20 +1484,18 @@ index 00000000..a8494c13
 +}
 diff --git a/src/dxvk/dxvk_gaze_vrs.h b/src/dxvk/dxvk_gaze_vrs.h
 new file mode 100644
-index 00000000..a2590144
+index 00000000..ec6c4244
 --- /dev/null
 +++ b/src/dxvk/dxvk_gaze_vrs.h
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,98 @@
 +#pragma once
 +
-+#include "dxvk_gaze_shm.h"
 +#include "dxvk_gaze_buffer.h"
 +
 +#include <array>
 +#include <chrono>
 +#include <cstdint>
 +#include <map>
-+#include <string>
 +#include <vector>
 +
 +#include "dxvk_include.h"
@@ -1215,6 +1505,7 @@ index 00000000..a2590144
 +
 +  class DxvkDevice;
 +  class DxvkCommandList;
++  struct GazeMap;
 +
 +  bool dxvkGazeVrsEnabled(const DxvkDevice *device);
 +
@@ -1234,16 +1525,6 @@ index 00000000..a2590144
 +        VkRenderingFragmentShadingRateAttachmentInfoKHR &info);
 +
 +  private:
-+    using GazeShm = gaze_bridge::SharedGaze;
-+
-+    struct Gaze
-+    {
-+      float cx[2];
-+      float cy[2];
-+      int32_t flipX[2];
-+      int32_t flipY[2];
-+    };
-+
 +    static constexpr uint32_t MaxLayers = 2u;
 +
 +    DxvkDevice *m_device = nullptr;
@@ -1271,15 +1552,13 @@ index 00000000..a2590144
 +    std::array<Rc<Slot>, 2> m_slots;
 +    GazeVrsBufferState m_buffers;
 +    bool m_ok = false;
++    struct Worker;
++    std::unique_ptr<Worker> m_mapWorker;
++    std::unique_ptr<GazeMap> m_cpuMap;
++    bool m_loggedWorkerFailure = false;
 +
 +    VkExtent2D m_texel = {16u, 16u};
 +    VkExtent2D m_maxTiles = {512u, 512u};
-+
-+    void *m_file = nullptr;
-+    void *m_map = nullptr;
-+    const GazeShm *m_shm = nullptr;
-+    std::chrono::steady_clock::time_point m_nextOpen = {};
-+    gaze_bridge::Freshness m_sourceFreshness;
 +
 +    // Configuration
 +    float m_r1 = 0.20f;
@@ -1291,35 +1570,19 @@ index 00000000..a2590144
 +    uint32_t m_autoCoarseRate = 0u;
 +    VkSampleCountFlagBits m_autoCoarseSamples = VkSampleCountFlagBits(0);
 +    uint32_t m_minSize = 700u;
-+    bool m_flipY = false; // extra global Y flip
-+    bool m_swapEyes = false;
-+    int m_forceFlipX[2] = {-1, -1}; // -1 = use source default
-+    int m_forceFlipY[2] = {-1, -1};
 +    bool m_debug = false;
 +    bool m_dot = false;
++    bool m_grid = false;
 +    int32_t m_dotRadius = 24;
-+    bool m_loggedNoGaze = false;
-+    float m_gainY = 1.0f;             // multiplies vertical gaze offset from center
-+    float m_winMin[2] = {1.0f, 1.0f}; // cx/cy range seen since last log line
-+    float m_winMax[2] = {0.0f, 0.0f};
-+    float m_winMinX[2] = {1.0f, 1.0f};
-+    float m_winMaxX[2] = {0.0f, 0.0f};
 +    uint32_t m_onlySamples = 0u; // 0 = any; else only passes with this color sample count
 +    uint32_t m_onlyFormat = 0u;  // 0 = any; else only passes with this VkFormat value
-+    float m_fixedY = 0.25f;      // y used by DXVK_GAZE_FAKE=fixed
-+    int m_fake = 0;              // 0 = real gaze, 1 = sweep x, 2 = sweep y, 3 = circle
 +    uint32_t m_forceW = 0u;
 +    uint32_t m_forceH = 0u;
-+    std::string m_path;
 +
 +    std::map<std::array<uint32_t, 5>, uint32_t> m_shapes; // (w, h, layers, fmt, samples) -> pass count
 +    std::chrono::steady_clock::time_point m_nextSummary = {};
-+    std::chrono::steady_clock::time_point m_nextGazeLog = {};
 +
 +    bool createResources();
-+    void openSource();
-+    void closeSource();
-+    bool readGaze(Gaze &g);
 +  };
 +
 +}
@@ -1399,14 +1662,15 @@ index a133519d..c40fc088 100644
      dyInfo.dynamicStateCount  = dynamicStates.size();
      dyInfo.pDynamicStates     = dynamicStates.data();
 diff --git a/src/dxvk/meson.build b/src/dxvk/meson.build
-index 6b12f95c..d17113e8 100644
+index 6b12f95c..27f9bc5a 100644
 --- a/src/dxvk/meson.build
 +++ b/src/dxvk/meson.build
-@@ -50,6 +50,7 @@ dxvk_src = [
+@@ -50,6 +50,8 @@ dxvk_src = [
    'dxvk_gpu_event.cpp',
    'dxvk_gpu_query.cpp',
    'dxvk_graphics.cpp',
 +  'dxvk_gaze_vrs.cpp',
++  'dxvk_gaze_source.cpp',
    'dxvk_hang.cpp',
    'dxvk_image.cpp',
    'dxvk_implicit_resolve.cpp',

@@ -131,7 +131,7 @@ untouched and reports an error.
 bash scripts/setup-dev.sh
 bash scripts/build-dxvk.sh         # dist/dxvk/{d3d11,dxgi}.dll
 bash scripts/build-openxr-bridge.sh # dist/gaze/openxr-gaze-bridge
-bash scripts/test-gaze-bridge.sh    # projection, IPC and simulated OpenXR tests
+bash scripts/test-gaze-bridge.sh    # projection, IPC, map worker and simulated OpenXR tests
 ```
 
 `DXVK_SOURCE_DIR`, `DXVK_OUTPUT_DIR` and `DXVK_BUILD_JOBS` override the DXVK

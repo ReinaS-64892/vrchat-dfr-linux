@@ -51,7 +51,7 @@ publishes odd sequence, header/payload, then even sequence, using sequentially
 consistent atomic operations. The reader accepts a packet only if the sequence
 is even and unchanged across atomic payload loads. It validates magic, version,
 size, finite coordinates and range. Readers retry interrupted snapshots on the
-next pass; they never block waiting for a writer.
+next worker tick; they never block waiting for a writer.
 
 The output is a regular file owned by the current user, mode 0600. Existing
 files must have size zero or exactly 64. The writer keeps the inode and
@@ -93,6 +93,34 @@ texture bounds. Gaze-dot alignment in VRChat must be checked on hardware;
 automated tests establish coordinate math and protocol behavior, not VRChat's
 projection conventions or end-to-end latency.
 
+## DXVK worker and GPU buffers
+
+`dxvk-cs` selects eligible render passes and sends their dimensions, layer
+count, format, sample count, VRS texel size and rate/radius settings to
+`dxvk-gaze-map`. The worker polls the shared gaze source every 4 ms after its
+first request. File opening/mapping, heartbeat checks, coordinate transforms,
+fake gaze, map allocation and full tile traversal run on this worker.
+
+The mailbox holds one queued request and one completed result. New requests
+replace queued work; an in-progress map finishes before the next request is
+handled. A try-lock lets the render thread skip the exchange under contention.
+CPU map ownership is swapped and storage is recycled by the worker. A stationary
+or tile-quantized unchanged gaze does not cause repeated map generation.
+
+The render thread records uploads only for completed maps compatible with the
+current pass. Two GPU image/upload-buffer slots retain the previous completed
+attachment while an upload is pending. A slot is overwritten only after all
+its recorded GPU uses finish; completion is polled without waiting. The upload
+and its command recording remain on the graphics path. Startup and target
+changes use full-rate rendering until a compatible map is ready. Invalid gaze
+or worker failure disables VRS. Debug DOT uses the gaze saved with the displayed
+GPU attachment, including worker and upload latency.
+
+`dxvk_gaze_source.*` owns the CPU gaze adapter, `dxvk_gaze_map.h` contains the
+map algorithm and mailbox/worker, and `dxvk_gaze_vrs.*` handles Vulkan integration.
+The worker implementation is private to the Vulkan integration source file so
+CPU changes do not require exposing worker details in the rendering header.
+
 ## Validation
 
 `bash scripts/test-gaze-bridge.sh` checks symmetric/asymmetric FOVs, canted eyes,
@@ -102,6 +130,12 @@ The real publisher is also linked against a simulated OpenXR implementation to
 test sampling, invalid tracking/views, inactive/unfocused actions, sample age,
 missing extensions, runtime restart, session loss, output locking, inode
 preservation, SIGTERM invalidation and SIGKILL sequence freeze.
+
+The same script also checks two-slot GPU ownership policy and the CPU map
+worker: map contents, alignment padding, latest-request replacement, mailbox
+contention, independent polling, invalidation/recovery and failure handling.
+Canonical DXVK additionally has a native source-adapter test for fake gaze,
+coordinate transforms and fixed-gaze caching.
 
 The patched Windows DLLs and Linux bridge build locally. Live HMD sampling,
 concurrent VRChat sessions, Wine/container file visibility, gaze-dot alignment

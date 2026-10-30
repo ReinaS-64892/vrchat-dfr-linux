@@ -40,8 +40,8 @@ device's image-size limit. Image allocation, aligned upload-buffer allocation
 and pass bounds checks use the same capacity, which is logged at startup.
 
 The patch also ports double-buffered uploads and matching DOT latency from
-canonical DXVK commit `985e429f25ca8c4ac70927f119df66f90e567178`
-(`DXVK_GAZE_COMMIT` in `versions.env`). `DXVK_COMMIT` is the matching upstream
+canonical DXVK commit `985e429f25ca8c4ac70927f119df66f90e567178`.
+`DXVK_COMMIT` is the matching upstream
 patch-application base; the patched source matches the canonical gaze revision.
 
 The VRS attachment and upload buffer now use two slots. Rendering keeps the
@@ -58,6 +58,25 @@ transfer work still occur, so live VRChat FPS improvement remains unmeasured.
 including upload latency and tile-granularity caching. The existing SBS-only DOT
 and `DXVK_GAZE_FAKE=grid` overlay behavior is retained. Slot lifetime is tracked
 by command lists, including teardown and partially failed resource allocation.
+
+Canonical DXVK commit `54010d54d3a41e0b23bdf08ba6e6dfd7a3683844`
+(`DXVK_GAZE_COMMIT`) moves gaze file mapping, freshness checks, transforms,
+fake gaze and tile-map generation onto `dxvk-gaze-map`. The worker polls every
+4 ms after receiving a candidate render-target description, computes outside
+the mailbox lock, and retains only the latest queued request and completed
+result. The render thread uses a try-lock and swaps CPU map ownership without
+allocating or freeing tile arrays. It never waits for map generation. Fixed
+or tile-quantized unchanged gaze skips regeneration. Invalid gaze is published
+to the render thread to disable VRS, including after a bridge heartbeat stalls.
+
+CPU logic lives in `dxvk_gaze_source.*` and `dxvk_gaze_map.h`. The worker is
+hidden behind a private implementation in `dxvk_gaze_vrs.cpp`; its header has
+no source or map-worker dependency. Vulkan allocation, pass compatibility,
+upload command recording and double-buffer publication remain on `dxvk-cs`.
+DOT coordinates travel with each generated map and GPU slot. The worker joins
+before its source mapping is closed during destruction. Unit tests cover map
+contents, source transforms, request replacement, try-lock contention,
+independent polling, invalidation/recovery, failure and worker shutdown.
 
 The working DXVK build configuration was:
 
