@@ -38,6 +38,26 @@ the GPU's texel size to cover at least 8192 pixels per axis, subject to the
 device's image-size limit. Image allocation, aligned upload-buffer allocation
 and pass bounds checks use the same capacity, which is logged at startup.
 
+The patch also ports double-buffered uploads and matching DOT latency from
+canonical DXVK commit `985e429f25ca8c4ac70927f119df66f90e567178`
+(`DXVK_GAZE_COMMIT` in `versions.env`). `DXVK_COMMIT` remains the upstream
+patch-application base, so existing setup and patch application remain valid.
+
+The VRS attachment and upload buffer now use two slots. Rendering keeps the
+completed front image while an upload is pending in the back slot. GPU command
+list completion is polled without waiting; a retired front slot is reused only
+after all its recorded reads finish. The upload-to-attachment barrier is emitted
+when publishing a completed image, before recording the next upload. Startup or
+an incompatible render-target change uses full-rate rendering until a matching
+image is ready. Updates may therefore lag by multiple frames when the GPU queue
+is backed up; this is not a fixed one-frame delay. CPU tile generation and GPU
+transfer work still occur, so live VRChat FPS improvement remains unmeasured.
+
+`DXVK_GAZE_DOT=1` uses the gaze coordinates saved with the displayed attachment,
+including upload latency and tile-granularity caching. The existing SBS-only DOT
+and `DXVK_GAZE_FAKE=grid` overlay behavior is retained. Slot lifetime is tracked
+by command lists, including teardown and partially failed resource allocation.
+
 The working DXVK build configuration was:
 
 ```text

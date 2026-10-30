@@ -98,7 +98,7 @@ remove or truncate it while a reader is running.
 | `DXVK_GAZE_R1` / `R2` | Inner / outer radius of the sharp region |
 | `DXVK_GAZE_COARSE` | Outer shading-rate code (`auto` = Highest available for your system), you may also enter an int |
 | `DXVK_GAZE_DEBUG=1` | Pass/gaze diagnostics |
-| `DXVK_GAZE_DOT=1` | Draw diagnostic gaze dots |
+| `DXVK_GAZE_DOT=1` | Draw dots at the gaze position used by the displayed VRS image, including upload latency (SBS only) |
 | `DXVK_GAZE_SWAP_EYES=1` | Swap per-eye gaze data |
 | `DXVK_GAZE_GAIN_Y` | Scale vertical gaze offset around center |
 | `DXVK_GAZE_FLIPX_L/R`, `FLIPY_L/R` | Force per-eye X/Y flip |
