@@ -32,6 +32,12 @@ The patch targets `d30be2baea02a67b9502bffda0ec8b0d915bb3d2`, recorded in
 build have been verified locally. The original VRS patch has been updated to
 read the versioned OpenXR bridge protocol instead of WiVRn's export format.
 
+The patch also includes the VRS tile-capacity fix from local DXVK commit
+`1e25cb242d23be9f5455dca11d8a0761d1c6daab`. Attachment capacity scales with
+the GPU's texel size to cover at least 8192 pixels per axis, subject to the
+device's image-size limit. Image allocation, aligned upload-buffer allocation
+and pass bounds checks use the same capacity, which is logged at startup.
+
 The working DXVK build configuration was:
 
 ```text
